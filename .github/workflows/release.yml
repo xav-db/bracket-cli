@@ -38,8 +38,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: bracket-cli-linux-amd64 }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, asset: bracket-cli-linux-arm64 }
+          # The oldest supported Ubuntu, so the binaries need the oldest glibc (2.35).
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, asset: bracket-cli-linux-amd64 }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, asset: bracket-cli-linux-arm64 }
           - { runner: macos-latest, target: aarch64-apple-darwin, asset: bracket-cli-macos-arm64 }
           - { runner: macos-latest, target: x86_64-apple-darwin, asset: bracket-cli-macos-amd64 }
           - { runner: windows-latest, target: x86_64-pc-windows-msvc, asset: bracket-cli-windows-amd64.exe }

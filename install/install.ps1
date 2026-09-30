@@ -15,15 +15,24 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 Write-Host "Downloading $url"
 Invoke-WebRequest -Uri $url -OutFile "$exe.download" -UseBasicParsing
-# Windows won't overwrite a running exe, but it will rename one. This is what `bracket update` relies on.
-Remove-Item -Force "$exe.old" -ErrorAction SilentlyContinue
-if (Test-Path $exe) { Move-Item -Force $exe "$exe.old" }
+# Windows won't overwrite or delete a running exe, but it will rename one, and a long-lived
+# `bracket ssh-proxy` may still be running an old binary. So park the current one under a unique
+# name, and sweep up earlier ones that are no longer in use. This is what `bracket update` relies on.
+Get-ChildItem -Path $dir -Filter 'bracket.exe.old-*' -ErrorAction SilentlyContinue |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+if (Test-Path $exe) { Move-Item -Force $exe "$exe.old-$([guid]::NewGuid().ToString('N'))" }
 Move-Item -Force "$exe.download" $exe
 
 Write-Host "Installed $(& $exe --version) to $dir"
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+# Edit the raw registry value so entries like %USERPROFILE%\bin stay unexpanded.
+$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+$userPath = $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
 if (($userPath -split ';') -notcontains $dir) {
-  [Environment]::SetEnvironmentVariable('Path', "$userPath;$dir", 'User')
+  $key.SetValue('Path', ((@($userPath, $dir) | Where-Object { $_ }) -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+  # Setting a user variable through .NET broadcasts the change, so new terminals see the new PATH.
+  [Environment]::SetEnvironmentVariable('BRACKET_INSTALL_REFRESH', '1', 'User')
+  [Environment]::SetEnvironmentVariable('BRACKET_INSTALL_REFRESH', $null, 'User')
   Write-Host "Added $dir to your PATH. Open a new terminal to use bracket."
 }
+$key.Close()
