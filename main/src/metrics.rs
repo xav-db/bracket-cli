@@ -19,9 +19,14 @@ use crate::error::{Error, Result};
 /// `GetMetricData` accepts at most this many queries per request.
 const MAX_QUERIES: usize = 500;
 
-/// Basic monitoring publishes every 5 minutes, so look back far enough to always catch one.
-const WINDOW: Duration = Duration::from_secs(15 * 60);
-const PERIOD_SECS: i32 = 300;
+/// Basic monitoring's resolution, which bracket uses everywhere.
+pub const PERIOD: Duration = Duration::from_secs(300);
+
+/// Look back far enough to always catch one basic-monitoring datapoint.
+const LATEST_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// Datapoints for one resource, oldest first.
+pub type Series = Vec<(SystemTime, f64)>;
 
 /// A CloudWatch namespace together with the dimension that identifies one resource in it.
 #[derive(Debug, Clone, Copy)]
@@ -48,10 +53,26 @@ pub async fn latest_cpu(
     ids: &[String],
 ) -> Result<HashMap<String, f64>> {
     let end = SystemTime::now();
-    let start = end - WINDOW;
-    let mut cpu = HashMap::with_capacity(ids.len());
+    let series = cpu_series(cloudwatch, source, ids, end - LATEST_WINDOW, end).await?;
+    Ok(series
+        .into_iter()
+        .filter_map(|(id, points)| Some((id, points.last()?.1)))
+        .collect())
+}
+
+/// Returns each resource's average CPU utilisation (percent) per [`PERIOD`] from `start` to
+/// `end`. Resources without any datapoints are left out of the map.
+pub async fn cpu_series(
+    cloudwatch: &Client,
+    source: Source,
+    ids: &[String],
+    start: SystemTime,
+    end: SystemTime,
+) -> Result<HashMap<String, Series>> {
+    let mut series: HashMap<String, Series> = HashMap::with_capacity(ids.len());
 
     // Chunks run one after another: past 500 dev boxes the extra round trip is the least of it.
+    // Within a chunk the paginator splits long series into pages of 100,800 datapoints.
     for chunk in ids.chunks(MAX_QUERIES) {
         let queries = chunk
             .iter()
@@ -63,7 +84,7 @@ pub async fn latest_cpu(
             .set_metric_data_queries(Some(queries))
             .start_time(DateTime::from(start))
             .end_time(DateTime::from(end))
-            .scan_by(ScanBy::TimestampDescending)
+            .scan_by(ScanBy::TimestampAscending)
             .into_paginator()
             .send()
             .try_collect()
@@ -71,11 +92,15 @@ pub async fn latest_cpu(
             .map_err(Error::aws("fetching CPU metrics"))?;
 
         let results = pages.iter().flat_map(|page| page.metric_data_results());
-        for (id, value) in latest_values(chunk, results) {
-            cpu.entry(id).or_insert(value);
+        for (id, points) in datapoints(chunk, results) {
+            series.entry(id).or_default().extend(points);
         }
     }
-    Ok(cpu)
+    // One series can span pages; keep each in time order regardless.
+    series
+        .values_mut()
+        .for_each(|points| points.sort_by_key(|(time, _)| *time));
+    Ok(series)
 }
 
 /// Query ids must match `^[a-z][a-zA-Z0-9_]*$`, so resource ids are referenced by position.
@@ -95,22 +120,27 @@ fn query(source: Source, index: usize, id: &str) -> MetricDataQuery {
         .metric_stat(
             MetricStat::builder()
                 .metric(metric)
-                .period(PERIOD_SECS)
+                .period(PERIOD.as_secs() as i32)
                 .stat("Average")
                 .build(),
         )
         .build()
 }
 
-/// Maps each result back to its resource id and takes its newest value. Results arrive
-/// newest-first because the request scans `TimestampDescending`.
-fn latest_values<'a>(
+/// Maps each result back to its resource id, paired with its datapoints.
+fn datapoints<'a>(
     chunk: &'a [String],
     results: impl Iterator<Item = &'a MetricDataResult> + 'a,
-) -> impl Iterator<Item = (String, f64)> + 'a {
+) -> impl Iterator<Item = (String, Series)> + 'a {
     results.filter_map(|result| {
         let index: usize = result.id()?.strip_prefix('q')?.parse().ok()?;
-        Some((chunk.get(index)?.clone(), *result.values().first()?))
+        let points = result
+            .timestamps()
+            .iter()
+            .zip(result.values())
+            .filter_map(|(time, value)| Some((SystemTime::try_from(*time).ok()?, *value)))
+            .collect();
+        Some((chunk.get(index)?.clone(), points))
     })
 }
 
@@ -120,24 +150,37 @@ mod tests {
     use aws_sdk_cloudwatch::operation::get_metric_data::GetMetricDataOutput;
     use aws_smithy_mocks::{mock, mock_client};
 
-    fn result(id: &str, values: &[f64]) -> MetricDataResult {
+    /// A result whose values sit at 5-minute marks `minutes` after the epoch.
+    fn result(id: &str, points: &[(u64, f64)]) -> MetricDataResult {
         MetricDataResult::builder()
             .id(id)
-            .set_values(Some(values.to_vec()))
+            .set_timestamps(Some(
+                points
+                    .iter()
+                    .map(|(minutes, _)| DateTime::from_secs(*minutes as i64 * 60))
+                    .collect(),
+            ))
+            .set_values(Some(points.iter().map(|(_, value)| *value).collect()))
             .build()
+    }
+
+    fn at(minutes: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(minutes * 60)
     }
 
     #[test]
     fn results_map_back_to_resource_ids_by_position() {
         let chunk = ["i-a".to_string(), "i-b".to_string()];
         let results = [
-            result("q1", &[12.5, 90.0]),
-            result("q0", &[]),
-            result("q7", &[1.0]),
-            result("bogus", &[1.0]),
+            result("q1", &[(5, 12.5), (10, 90.0)]),
+            result("q7", &[(5, 1.0)]),
+            result("bogus", &[(5, 1.0)]),
         ];
-        let values: Vec<_> = latest_values(&chunk, results.iter()).collect();
-        assert_eq!(values, vec![("i-b".to_string(), 12.5)]);
+        let values: Vec<_> = datapoints(&chunk, results.iter()).collect();
+        assert_eq!(
+            values,
+            vec![("i-b".to_string(), vec![(at(5), 12.5), (at(10), 90.0)])]
+        );
     }
 
     #[test]
@@ -145,7 +188,7 @@ mod tests {
         let query = query(NEPTUNE, 3, "graph");
         assert_eq!(query.id(), Some("q3"));
         let stat = query.metric_stat().unwrap();
-        assert_eq!(stat.period(), Some(PERIOD_SECS));
+        assert_eq!(stat.period(), Some(300));
         assert_eq!(stat.stat(), Some("Average"));
         let metric = stat.metric().unwrap();
         assert_eq!(metric.namespace(), Some("AWS/Neptune"));
@@ -160,8 +203,8 @@ mod tests {
             .match_requests(|req| req.metric_data_queries().len() == 3)
             .then_output(|| {
                 GetMetricDataOutput::builder()
-                    .metric_data_results(result("q0", &[5.0]))
-                    .metric_data_results(result("q2", &[75.0, 10.0]))
+                    .metric_data_results(result("q0", &[(5, 5.0)]))
+                    .metric_data_results(result("q2", &[(5, 10.0), (10, 75.0)]))
                     .build()
             });
         let client = mock_client!(aws_sdk_cloudwatch, [&rule]);
@@ -180,7 +223,7 @@ mod tests {
         let rule = mock!(Client::get_metric_data).then_compute_output(|req| {
             assert!(req.metric_data_queries().len() <= MAX_QUERIES);
             GetMetricDataOutput::builder()
-                .metric_data_results(result("q0", &[1.0]))
+                .metric_data_results(result("q0", &[(5, 1.0)]))
                 .build()
         });
         let client = mock_client!(
@@ -211,5 +254,35 @@ mod tests {
 
         assert!(cpu.is_empty());
         assert_eq!(rule.num_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn series_spanning_pages_are_joined_in_time_order() {
+        let rule = mock!(Client::get_metric_data)
+            .sequence()
+            .output(|| {
+                GetMetricDataOutput::builder()
+                    .metric_data_results(result("q0", &[(10, 2.0), (15, 3.0)]))
+                    .next_token("more")
+                    .build()
+            })
+            .output(|| {
+                GetMetricDataOutput::builder()
+                    .metric_data_results(result("q0", &[(5, 1.0)]))
+                    .metric_data_results(result("q1", &[(5, 9.0)]))
+                    .build()
+            })
+            .build();
+        let client = mock_client!(aws_sdk_cloudwatch, [&rule]);
+        let ids = ["a", "b"].map(String::from);
+
+        let series = cpu_series(&client, EC2, &ids, at(0), at(20)).await.unwrap();
+
+        assert_eq!(rule.num_calls(), 2);
+        assert_eq!(
+            series["a"],
+            vec![(at(5), 1.0), (at(10), 2.0), (at(15), 3.0)]
+        );
+        assert_eq!(series["b"], vec![(at(5), 9.0)]);
     }
 }

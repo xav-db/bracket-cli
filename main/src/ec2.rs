@@ -7,7 +7,7 @@ use aws_config::Region;
 use aws_sdk_ec2::{
     Client,
     client::Waiters,
-    types::{Filter, InstanceStateName},
+    types::{Filter, InstanceLifecycleType, InstanceStateName},
 };
 use console::Style;
 
@@ -72,6 +72,9 @@ pub struct Instance {
     pub instance_type: String,
     pub public_ip: Option<String>,
     pub private_ip: Option<String>,
+    /// Cores × threads per core, when EC2 reports them.
+    pub vcpus: Option<u32>,
+    pub spot: bool,
 }
 
 impl Instance {
@@ -93,6 +96,11 @@ impl Instance {
                 .unwrap_or_default(),
             public_ip: instance.public_ip_address().map(str::to_string),
             private_ip: instance.private_ip_address().map(str::to_string),
+            vcpus: instance.cpu_options().and_then(|cpu| {
+                let vcpus = cpu.core_count()? * cpu.threads_per_core()?;
+                u32::try_from(vcpus).ok()
+            }),
+            spot: instance.instance_lifecycle() == Some(&InstanceLifecycleType::Spot),
         })
     }
 
@@ -255,9 +263,9 @@ pub async fn ensure_running(ec2: &Client, instance: &Instance) -> Result<bool> {
 
 /// The live instances in one region.
 #[derive(Debug)]
-struct Fleet {
-    region: String,
-    instances: Vec<Instance>,
+pub struct Fleet {
+    pub region: String,
+    pub instances: Vec<Instance>,
 }
 
 /// Every region enabled for the account, which is what `DescribeRegions` returns by default.
@@ -320,18 +328,15 @@ fn preselect(fleets: &[Fleet], last: Option<&str>, configured: &str) -> usize {
         .unwrap_or_default()
 }
 
-/// `bracket list ec2`: finds the regions with instances, asks which to show (starting on the
-/// one shown last time), then lists it.
-pub async fn list() -> Result<()> {
-    ui::intro("EC2 instances")?;
-    let aws = Aws::load().await?;
+/// Scans every enabled region under a spinner, warning about any that didn't answer, and
+/// returns the regions that have instances, sorted by region.
+pub async fn survey(aws: &Aws) -> Result<Vec<Fleet>> {
     let in_region = |region: &str| {
         aws_sdk_ec2::config::Builder::from(&aws.config)
             .region(Region::new(region.to_string()))
             .build()
     };
-
-    let (mut fleets, failed, _) = ui::step(
+    let (fleets, failed, _) = ui::step(
         "Scanning regions",
         async {
             let regions = regions(&Client::new(&aws.config)).await?;
@@ -349,13 +354,21 @@ pub async fn list() -> Result<()> {
         |(fleets, _, total)| format!("Found instances in {} of {total} regions", fleets.len()),
     )
     .await?;
-
     if !failed.is_empty() {
         cliclack::log::warning(format!(
             "Skipped regions that didn't answer: {}",
             failed.join(", ")
         ))?;
     }
+    Ok(fleets)
+}
+
+/// `bracket list ec2`: finds the regions with instances, asks which to show (starting on the
+/// one shown last time), then lists it.
+pub async fn list() -> Result<()> {
+    ui::intro("EC2 instances")?;
+    let aws = Aws::load().await?;
+    let mut fleets = survey(&aws).await?;
     if fleets.is_empty() {
         cliclack::outro("No instances in any region")?;
         return Ok(());
@@ -540,7 +553,13 @@ mod tests {
             .instance_id(id)
             .instance_type(InstanceType::T3Large)
             .state(InstanceState::builder().name(state).build())
-            .private_ip_address("10.0.0.5");
+            .private_ip_address("10.0.0.5")
+            .cpu_options(
+                aws_sdk_ec2::types::CpuOptions::builder()
+                    .core_count(2)
+                    .threads_per_core(2)
+                    .build(),
+            );
         match name {
             Some(name) => builder.tags(Tag::builder().key("Name").value(name).build()),
             None => builder,
@@ -556,17 +575,16 @@ mod tests {
             instance_type: "t3.large".into(),
             public_ip: None,
             private_ip: None,
+            vcpus: Some(2),
+            spot: false,
         }
     }
 
     #[test]
     fn sdk_instances_convert_with_their_name_tag() {
-        let converted = Instance::from_sdk(&sdk_instance(
-            "i-1",
-            Some("dev"),
-            InstanceStateName::Running,
-        ))
-        .unwrap();
+        let mut spot = sdk_instance("i-1", Some("dev"), InstanceStateName::Running);
+        spot.instance_lifecycle = Some(InstanceLifecycleType::Spot);
+        let converted = Instance::from_sdk(&spot).unwrap();
         assert_eq!(
             converted,
             Instance {
@@ -576,6 +594,8 @@ mod tests {
                 instance_type: "t3.large".into(),
                 public_ip: None,
                 private_ip: Some("10.0.0.5".into()),
+                vcpus: Some(4),
+                spot: true,
             }
         );
         assert_eq!(converted.display_name(), "dev");
