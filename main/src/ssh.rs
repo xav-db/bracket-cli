@@ -85,6 +85,30 @@ pub fn alias(name: &str) -> String {
     format!("bracket-{slug}")
 }
 
+/// The alias to use for `instance_id`: [`alias`] of its name, unless that host already belongs to
+/// another instance (the same Name tag in another region, say). Then the id is appended, so
+/// connecting to one never silently repoints the other's Cursor window.
+pub fn alias_for(paths: &Paths, name: &str, instance_id: &str) -> String {
+    let alias = alias(name);
+    let owner = format!("HostKeyAlias {instance_id}");
+    match fs::read_to_string(paths.hosts().join(&alias)) {
+        Ok(block) if !block.lines().any(|line| line.trim() == owner) => {
+            format!("{alias}-{instance_id}")
+        }
+        _ => alias,
+    }
+}
+
+/// Quotes one ProxyCommand argument. ssh expands `%` tokens first, then runs the line with
+/// `/bin/sh -c` on Unix, where single quotes stop every expansion, or directly on Windows.
+fn quote(arg: &str) -> String {
+    let arg = arg.replace('%', "%%");
+    match cfg!(windows) {
+        true => format!("\"{arg}\""),
+        false => format!("'{}'", arg.replace('\'', r"'\''")),
+    }
+}
+
 /// Everything needed to reach one instance through `bracket ssh-proxy`.
 pub struct Host<'a> {
     pub alias: &'a str,
@@ -99,9 +123,6 @@ impl Host<'_> {
     /// Renders the `Host` block. The instance id stands in for the host name: the proxy looks up
     /// the live address on each connection, so a restart that changes the IP needs no rewrite.
     fn block(&self) -> String {
-        // ProxyCommand runs through a shell and expands `%` tokens, so quote each argument and
-        // escape `%`.
-        let quote = |arg: &str| format!("\"{}\"", arg.replace('%', "%%"));
         let bracket = quote(&self.bracket.to_string_lossy());
         let profile = self
             .profile
@@ -136,8 +157,38 @@ fn with_include(config: &str) -> Option<String> {
 pub fn install(paths: &Paths, host: &Host) -> Result<()> {
     create_private_dir(&paths.hosts())?;
     ensure_key(paths)?;
-    fs::write(paths.hosts().join(host.alias), host.block())?;
+    // OpenSSH refuses to run at all if an included file is group- or world-writable, which a
+    // umask of 002 would otherwise produce. So host files are always written as 600.
+    write_atomically(&paths.hosts().join(host.alias), &host.block(), None)?;
     ensure_include(paths)
+}
+
+/// Replaces `path` with `contents` in one step, so a crash or full disk mid-write leaves the old
+/// file intact. The result gets `permissions`, or mode 600 when that's `None`.
+fn write_atomically(
+    path: &Path,
+    contents: &str,
+    permissions: Option<fs::Permissions>,
+) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other(format!("{} is not a file path", path.display())))?;
+    let temp = path.with_file_name(format!(".{}.bracket-tmp", name.to_string_lossy()));
+    // A leftover temp file could carry any mode; start fresh so ours applies.
+    if let Err(err) = fs::remove_file(&temp)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        return Err(err);
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&temp)?;
+    file.write_all(contents.as_bytes())?;
+    permissions.map_or(Ok(()), |permissions| file.set_permissions(permissions))?;
+    file.sync_all()?;
+    fs::rename(&temp, path)
 }
 
 /// Creates `dir` and any missing parents, readable only by the user on Unix, as ssh expects.
@@ -178,23 +229,24 @@ fn ensure_key(paths: &Paths) -> Result<()> {
     }
 }
 
-/// Adds the `Include` to `~/.ssh/config`, creating the file (mode 600) if needed. Writing in
-/// place keeps the file's permissions and, if it's a symlink into a dotfiles repo, the link.
+/// Adds the `Include` to `~/.ssh/config`, creating it (mode 600) if needed.
+///
+/// The file is replaced atomically so it can never be left half-written, keeps its permissions,
+/// and, when it's a symlink into a dotfiles repo, is written through the link.
 fn ensure_include(paths: &Paths) -> Result<()> {
-    let path = paths.config();
-    let current = match fs::read_to_string(&path) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
-        read => read?,
+    let (target, current, permissions) = match fs::canonicalize(paths.config()) {
+        Ok(target) => {
+            let current = fs::read_to_string(&target)?;
+            let permissions = fs::metadata(&target)?.permissions();
+            (target, current, Some(permissions))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (paths.config(), String::new(), None),
+        Err(err) => return Err(err.into()),
     };
     let Some(updated) = with_include(&current) else {
         return Ok(());
     };
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    // Only applies when the file is created; an existing file keeps its mode.
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(&path)?.write_all(updated.as_bytes())?;
+    write_atomically(&target, &updated, permissions)?;
     Ok(())
 }
 
@@ -222,6 +274,7 @@ mod tests {
         assert!(!alias("a/b\\c d").contains(['/', '\\', ' ']));
     }
 
+    #[cfg(unix)]
     #[test]
     fn host_block_routes_through_the_proxy() {
         let block = host(Path::new("/usr/local/bin/bracket"), None).block();
@@ -236,16 +289,68 @@ mod tests {
                HostKeyAlias i-0abc\n  \
                StrictHostKeyChecking accept-new\n  \
                UserKnownHostsFile ~/.ssh/bracket/known_hosts\n  \
-               ProxyCommand \"/usr/local/bin/bracket\" ssh-proxy i-0abc --region \"us-east-2\"\n"
+               ProxyCommand '/usr/local/bin/bracket' ssh-proxy i-0abc --region 'us-east-2'\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_arguments_survive_the_shell() {
+        assert_eq!(quote("/usr/bin/bracket"), "'/usr/bin/bracket'");
+        assert_eq!(
+            quote("/Users/a b/100%/$HOME/`x`"),
+            "'/Users/a b/100%%/$HOME/`x`'"
+        );
+        assert_eq!(quote("it's"), r"'it'\''s'");
+
+        // Round-trip through a real shell to prove nothing expands.
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "printf %s {}",
+                quote("a b $HOME `id` \\ \" it's").replace("%%", "%")
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "a b $HOME `id` \\ \" it's"
         );
     }
 
     #[test]
-    fn host_block_quotes_awkward_paths_and_passes_the_profile() {
-        let block = host(Path::new("/Users/a b/100%/bracket"), Some("dev team")).block();
-        assert!(block.contains(
-            "ProxyCommand \"/Users/a b/100%%/bracket\" ssh-proxy i-0abc --region \"us-east-2\" --profile \"dev team\"\n"
-        ));
+    fn host_block_passes_the_profile() {
+        let block = host(Path::new("/bin/bracket"), Some("dev team")).block();
+        let proxy = block
+            .lines()
+            .find(|line| line.contains("ProxyCommand"))
+            .unwrap();
+        assert!(proxy.ends_with(&format!(
+            "ssh-proxy i-0abc --region {} --profile {}",
+            quote("us-east-2"),
+            quote("dev team")
+        )));
+    }
+
+    #[test]
+    fn aliases_stay_with_their_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().to_path_buf());
+        assert_eq!(alias_for(&paths, "dev", "i-1"), "bracket-dev");
+
+        install(
+            &paths,
+            &Host {
+                alias: "bracket-dev",
+                instance_id: "i-1",
+                ..host(Path::new("/b"), None)
+            },
+        )
+        .unwrap();
+        assert_eq!(alias_for(&paths, "dev", "i-1"), "bracket-dev");
+        assert_eq!(alias_for(&paths, "Dev", "i-2"), "bracket-dev-i-2");
+        // An id that merely starts with the owner's id is a different instance.
+        assert_eq!(alias_for(&paths, "dev", "i-10"), "bracket-dev-i-10");
     }
 
     #[test]
@@ -323,5 +428,68 @@ mod tests {
 
         assert_ne!(fs::read_to_string(paths.key()).unwrap(), "stale");
         assert!(paths.public_key().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_files_are_private_even_if_they_were_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().to_path_buf());
+        create_private_dir(&paths.hosts()).unwrap();
+        let file = paths.hosts().join("bracket-dev");
+        fs::write(&file, "old").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o664)).unwrap();
+
+        install(&paths, &host(Path::new("/b"), None)).unwrap();
+
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!paths.hosts().join(".bracket-dev.bracket-tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_keeps_its_link_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join(".ssh"));
+        create_private_dir(&dir.path().join(".ssh")).unwrap();
+        let dotfiles = dir.path().join("dotfiles-ssh-config");
+        fs::write(&dotfiles, "Host *\n  AddKeysToAgent yes\n").unwrap();
+        fs::set_permissions(&dotfiles, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, paths.config()).unwrap();
+
+        install(&paths, &host(Path::new("/b"), None)).unwrap();
+
+        assert!(
+            fs::symlink_metadata(paths.config())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let config = fs::read_to_string(&dotfiles).unwrap();
+        assert_eq!(
+            config,
+            format!("{INCLUDE}\n\nHost *\n  AddKeysToAgent yes\n")
+        );
+        assert_eq!(
+            fs::metadata(&dotfiles).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn stale_temp_files_are_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("file");
+        fs::write(dir.path().join(".file.bracket-tmp"), "junk").unwrap();
+
+        write_atomically(&target, "fresh", None).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "fresh");
+        assert!(!dir.path().join(".file.bracket-tmp").exists());
     }
 }

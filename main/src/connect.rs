@@ -8,7 +8,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpStream, ToSocketAddrs},
     time::Instant,
 };
@@ -34,11 +34,12 @@ pub async fn connect(name: Option<String>) -> Result<()> {
     let instance = ec2::pick(&ec2, name, "Which instance do you want to open?").await?;
     let booted = ec2::ensure_running(&ec2, &instance).await?;
 
-    let alias = ssh::alias(instance.display_name());
+    let paths = ssh::Paths::from_home()?;
+    let alias = ssh::alias_for(&paths, instance.display_name(), &instance.id);
     let bracket = std::env::current_exe()?;
     let profile = std::env::var("AWS_PROFILE").ok();
     ssh::install(
-        &ssh::Paths::from_home()?,
+        &paths,
         &ssh::Host {
             alias: &alias,
             instance_id: &instance.id,
@@ -59,7 +60,12 @@ pub async fn connect(name: Option<String>) -> Result<()> {
     )
     .await?;
 
-    let status = Command::new("cursor")
+    // Cursor's command is a batch file on Windows, and Command only fills in `.exe` itself.
+    let cursor = match cfg!(windows) {
+        true => "cursor.cmd",
+        false => "cursor",
+    };
+    let status = Command::new(cursor)
         .arg("--folder-uri")
         .arg(format!("vscode-remote://ssh-remote+{alias}/home/{}", ssh::USER))
         .stdout(Stdio::null())
@@ -76,6 +82,14 @@ pub async fn connect(name: Option<String>) -> Result<()> {
         });
     }
 
+    // Cursor launches the ProxyCommand itself, with Cursor's environment rather than this
+    // shell's, so keys exported only here (aws-vault, say) won't reach its reconnects.
+    if std::env::var_os("AWS_ACCESS_KEY_ID").is_some() && profile.is_none() {
+        cliclack::log::warning(
+            "Your AWS credentials come from environment variables, which Cursor may not have. \
+             If it can't reconnect later, use an AWS profile instead.",
+        )?;
+    }
     cliclack::log::remark(format!("From a terminal: ssh {alias}"))?;
     cliclack::outro(format!("Opened {} in Cursor", instance.display_name()))?;
     Ok(())
@@ -170,19 +184,37 @@ pub async fn proxy(args: SshProxyArgs) -> Result<()> {
     }
 }
 
-/// Copies bytes both ways between `stdio` and a TCP connection to `addr` until both sides close.
-async fn pipe(
-    mut stdio: impl AsyncRead + AsyncWrite + Unpin,
-    addr: impl ToSocketAddrs,
-) -> io::Result<()> {
+/// Copies bytes both ways between `stdio` and a TCP connection to `addr`.
+///
+/// Returns as soon as the server closes. Waiting for stdin to close too would hang: shutting
+/// down tokio's stdout doesn't close it, so ssh would never learn the connection had ended.
+/// When ssh closes stdin first, the socket's write half is shut and the server's reply drained.
+async fn pipe(stdio: impl AsyncRead + AsyncWrite, addr: impl ToSocketAddrs) -> io::Result<()> {
     let mut stream = tokio::time::timeout(TCP_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| {
             io::Error::new(io::ErrorKind::TimedOut, "timed out connecting to port 22")
         })??;
     stream.set_nodelay(true)?;
-    tokio::io::copy_bidirectional(&mut stdio, &mut stream).await?;
-    Ok(())
+    let (mut from_server, mut to_server) = stream.split();
+    let (mut from_ssh, mut to_ssh) = tokio::io::split(stdio);
+
+    let download = async {
+        tokio::io::copy(&mut from_server, &mut to_ssh).await?;
+        to_ssh.flush().await
+    };
+    let upload = async {
+        tokio::io::copy(&mut from_ssh, &mut to_server).await?;
+        to_server.shutdown().await
+    };
+    tokio::pin!(download, upload);
+    tokio::select! {
+        done = &mut download => done,
+        sent = &mut upload => {
+            sent?;
+            download.await
+        }
+    }
 }
 
 /// Hands stdio to the AWS CLI's Instance Connect Endpoint tunnel for instances without a public IP.
@@ -235,6 +267,29 @@ mod tests {
         proxy.await.unwrap().unwrap();
         assert_eq!(server.await.unwrap(), b"SSH-2.0-client\r\n");
         assert_eq!(reply, b"SSH-2.0-test\r\n");
+    }
+
+    #[tokio::test]
+    async fn pipe_returns_when_the_server_hangs_up_first() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"bye").await.unwrap();
+            // Dropping the socket closes the connection while ssh still has stdin open.
+        });
+
+        let (mut ssh, stdio) = tokio::io::duplex(64);
+        let proxy = tokio::spawn(pipe(stdio, addr));
+        let mut reply = [0; 3];
+        ssh.read_exact(&mut reply).await.unwrap();
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), proxy).await;
+        finished
+            .expect("pipe hung after the server closed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"bye");
     }
 
     #[tokio::test]
