@@ -16,8 +16,11 @@ use aws_sdk_cloudwatch::{
 
 use crate::error::{Error, Result};
 
-/// `GetMetricData` accepts at most this many queries per request.
+/// `GetMetricData` accepts at most this many queries per request...
 const MAX_QUERIES: usize = 500;
+
+/// ...and returns at most this many datapoints per page.
+const MAX_DATAPOINTS: usize = 100_800;
 
 /// Basic monitoring's resolution, which bracket uses everywhere.
 pub const PERIOD: Duration = Duration::from_secs(300);
@@ -69,30 +72,41 @@ pub async fn cpu_series(
     start: SystemTime,
     end: SystemTime,
 ) -> Result<HashMap<String, Series>> {
+    // Size each request so its datapoints fit in one page, then send them all at once instead
+    // of paging through a big request one round trip at a time. A 14-day window fits 25
+    // instances per request; a 15-minute one, the 500-query maximum.
+    let per_series = (end.duration_since(start).unwrap_or_default().as_secs() / PERIOD.as_secs())
+        .max(1) as usize;
+    let per_request = (MAX_DATAPOINTS / per_series).clamp(1, MAX_QUERIES);
+    let mut tasks = tokio::task::JoinSet::new();
+    for chunk in ids.chunks(per_request) {
+        let (cloudwatch, chunk) = (cloudwatch.clone(), chunk.to_vec());
+        tasks.spawn(async move {
+            let queries = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, id)| query(source, index, id))
+                .collect();
+            // Still paginated, in case CloudWatch pages sooner than documented.
+            let pages = cloudwatch
+                .get_metric_data()
+                .set_metric_data_queries(Some(queries))
+                .start_time(DateTime::from(start))
+                .end_time(DateTime::from(end))
+                .scan_by(ScanBy::TimestampAscending)
+                .into_paginator()
+                .send()
+                .try_collect()
+                .await
+                .map_err(Error::aws("fetching CPU metrics"))?;
+            let results = pages.iter().flat_map(|page| page.metric_data_results());
+            Ok::<_, Error>(datapoints(&chunk, results).collect::<Vec<_>>())
+        });
+    }
+
     let mut series: HashMap<String, Series> = HashMap::with_capacity(ids.len());
-
-    // Chunks run one after another: past 500 dev boxes the extra round trip is the least of it.
-    // Within a chunk the paginator splits long series into pages of 100,800 datapoints.
-    for chunk in ids.chunks(MAX_QUERIES) {
-        let queries = chunk
-            .iter()
-            .enumerate()
-            .map(|(index, id)| query(source, index, id))
-            .collect();
-        let pages = cloudwatch
-            .get_metric_data()
-            .set_metric_data_queries(Some(queries))
-            .start_time(DateTime::from(start))
-            .end_time(DateTime::from(end))
-            .scan_by(ScanBy::TimestampAscending)
-            .into_paginator()
-            .send()
-            .try_collect()
-            .await
-            .map_err(Error::aws("fetching CPU metrics"))?;
-
-        let results = pages.iter().flat_map(|page| page.metric_data_results());
-        for (id, points) in datapoints(chunk, results) {
+    for found in tasks.join_all().await {
+        for (id, points) in found? {
             series.entry(id).or_default().extend(points);
         }
     }
@@ -284,5 +298,33 @@ mod tests {
             vec![(at(5), 1.0), (at(10), 2.0), (at(15), 3.0)]
         );
         assert_eq!(series["b"], vec![(at(5), 9.0)]);
+    }
+
+    #[tokio::test]
+    async fn long_windows_are_split_so_each_request_fits_one_page() {
+        let rule = mock!(Client::get_metric_data).then_compute_output(|req| {
+            // 14 days of 5-minute points is 4,032 per series: 25 series fill a page.
+            assert!(req.metric_data_queries().len() <= 25);
+            GetMetricDataOutput::builder()
+                .metric_data_results(result("q0", &[(5, 1.0)]))
+                .build()
+        });
+        let client = mock_client!(
+            aws_sdk_cloudwatch,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            [&rule]
+        );
+        let ids: Vec<String> = (0..60).map(|i| format!("i-{i}")).collect();
+
+        let series = cpu_series(&client, EC2, &ids, at(0), at(14 * 24 * 60))
+            .await
+            .unwrap();
+
+        assert_eq!(rule.num_calls(), 3);
+        assert!(
+            ["i-0", "i-25", "i-50"]
+                .iter()
+                .all(|id| series.contains_key(*id))
+        );
     }
 }

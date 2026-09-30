@@ -216,6 +216,7 @@ impl Slot {
 
 /// Totals `tracks` over the last `range` of the history.
 fn summarize(label: String, detail: String, tracks: &[&Track], range: Range) -> Summary {
+    debug_assert!(tracks.iter().all(|track| track.cpu.len() == HISTORY));
     let first = HISTORY - range.slots();
     let slots: Vec<Slot> = (first..HISTORY)
         .map(|slot| {

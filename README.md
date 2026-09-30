@@ -33,6 +33,7 @@ bracket uses your normal AWS credentials and region, so whatever works for the A
 | --- | --- |
 | `bracket connect ec2 [name]` | Starts the instance if needed, waits for SSH, and opens it in Cursor. |
 | `bracket list ec2` | Asks which region to show (only regions with instances, starting on the one you picked last), then lists instances with state, type, CPU, and IP. `bracket ls ec2` does the same. |
+| `bracket usage ec2` | Opens a dashboard of CPU and estimated cost over the last 24h, 7d, or 14d, by instance, region, or family. |
 | `bracket list neptune` | Lists Neptune clusters with status, size, and CPU. |
 | `bracket stop ec2 [name]` | Stops an instance. |
 | `bracket stop neptune [name]` | Stops a Neptune cluster. |
@@ -41,6 +42,10 @@ bracket uses your normal AWS credentials and region, so whatever works for the A
 | `bracket update` | Installs the latest release over the current binary. |
 
 Leave out `[name]` to pick from a list. Names are EC2 `Name` tags, Neptune cluster identifiers, and App Runner service names.
+
+## How `usage` estimates cost
+
+A running instance publishes a CPU datapoint to CloudWatch every 5 minutes, so each datapoint also counts 5 minutes of running time. Cost is that running time multiplied by the instance type's on-demand Linux price, which comes from the AWS Price List API and is cached for a week. The estimate leaves out EBS, data transfer, and Reserved Instance or Savings Plan discounts, counts spot instances at the on-demand price, and only covers instances that still exist.
 
 ## How `connect` works
 

@@ -218,8 +218,9 @@ impl App {
         let table = Table::new(
             rows,
             [
-                Constraint::Fill(2),
-                Constraint::Fill(3),
+                Constraint::Fill(1),
+                // Fits "us-east-2 · c8gd.8xlarge" and "83 instances in 2 regions".
+                Constraint::Length(26),
                 Constraint::Length(6),
                 Constraint::Length(9),
                 Constraint::Length(9),
@@ -255,9 +256,10 @@ fn cost_label(row: &Summary) -> String {
     }
 }
 
-/// `$0.017`, `$12.40`, `$1,234`.
+/// `$0`, `$0.017`, `$12.40`, `$1,234`.
 fn usd(amount: f64) -> String {
     match amount {
+        0.0 => "$0".into(),
         amount if amount < 1.0 => format!("${amount:.3}"),
         amount if amount < 100.0 => format!("${amount:.2}"),
         amount => {
@@ -394,8 +396,8 @@ fn footer_text(sort: Sort) -> Paragraph<'static> {
         Span::raw(" quit"),
     ]);
     let note = Line::styled(
-        " Estimated: on-demand Linux price × running time. Leaves out EBS, data transfer, and \
-         discounts; spot runs at on-demand price. + means some instances have no price.",
+        " Estimates: on-demand Linux price × running time. No EBS, data transfer, or discounts; \
+         spot at on-demand. + = some unpriced.",
         Style::new().add_modifier(Modifier::DIM),
     );
     Paragraph::new(vec![help, note])
@@ -429,6 +431,7 @@ mod tests {
 
     #[test]
     fn money_reads_naturally() {
+        assert_eq!(usd(0.0), "$0");
         assert_eq!(usd(0.0168), "$0.017");
         assert_eq!(usd(12.4), "$12.40");
         assert_eq!(usd(1234.4), "$1,234");
@@ -548,7 +551,7 @@ mod tests {
             "-7d",
             "now",
             "sort (cost)",
-            "Estimated: on-demand",
+            "Estimates: on-demand",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }

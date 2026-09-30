@@ -26,7 +26,7 @@ pub enum Command {
         target: StopTarget,
     },
 
-    /// List resources in the current AWS region.
+    /// List resources: EC2 in a region you pick, Neptune in the current one.
     #[command(visible_alias = "ls")]
     List {
         #[command(subcommand)]
