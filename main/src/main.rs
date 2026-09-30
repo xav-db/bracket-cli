@@ -8,16 +8,22 @@ mod ec2;
 mod error;
 mod metrics;
 mod neptune;
+mod pricing;
 mod ssh;
 mod state;
+mod tui;
 mod ui;
 mod update;
+mod usage;
 
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use cli::{AppRunnerCommand, Cli, Command, ConfigTarget, ConnectTarget, ListTarget, StopTarget};
+use cli::{
+    AppRunnerCommand, Cli, Command, ConfigTarget, ConnectTarget, ListTarget, StopTarget,
+    UsageTarget,
+};
 use error::Error;
 
 #[tokio::main(flavor = "current_thread")]
@@ -47,6 +53,9 @@ async fn main() -> ExitCode {
         Command::List {
             target: ListTarget::Neptune,
         } => neptune::list().await,
+        Command::Usage {
+            target: UsageTarget::Ec2,
+        } => usage::run().await,
         Command::Config {
             target: ConfigTarget::Aws,
         } => aws::configure().await,

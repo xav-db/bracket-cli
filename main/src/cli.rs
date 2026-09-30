@@ -33,6 +33,12 @@ pub enum Command {
         target: ListTarget,
     },
 
+    /// Explore CPU and estimated cost over time in an interactive dashboard.
+    Usage {
+        #[command(subcommand)]
+        target: UsageTarget,
+    },
+
     /// Set up local credentials.
     Config {
         #[command(subcommand)]
@@ -84,6 +90,12 @@ pub enum ListTarget {
 
     /// List Neptune clusters with their status and CPU.
     Neptune,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UsageTarget {
+    /// EC2 CPU and on-demand cost over the last 14 days, by instance, region, or family.
+    Ec2,
 }
 
 #[derive(Debug, Subcommand)]
@@ -151,6 +163,18 @@ mod tests {
                 target: ListTarget::Ec2
             }
         ));
+    }
+
+    #[test]
+    fn usage_takes_a_target() {
+        let cli = Cli::parse_from(["bracket", "usage", "ec2"]);
+        assert!(matches!(
+            cli.command,
+            Command::Usage {
+                target: UsageTarget::Ec2
+            }
+        ));
+        assert!(Cli::try_parse_from(["bracket", "usage"]).is_err());
     }
 
     #[test]
