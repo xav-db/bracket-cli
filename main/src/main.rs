@@ -9,6 +9,7 @@ mod error;
 mod metrics;
 mod neptune;
 mod ssh;
+mod state;
 mod ui;
 mod update;
 

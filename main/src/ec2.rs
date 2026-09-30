@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, time::Duration, time::Instant};
 
+use aws_config::Region;
 use aws_sdk_ec2::{
     Client,
     client::Waiters,
@@ -13,7 +14,7 @@ use console::Style;
 use crate::{
     aws::Aws,
     error::{self, Error, Resource, Result},
-    metrics,
+    metrics, state,
     ui::{self, Cell},
 };
 
@@ -252,42 +253,181 @@ pub async fn ensure_running(ec2: &Client, instance: &Instance) -> Result<bool> {
     Ok(true)
 }
 
-/// `bracket list ec2`.
+/// The live instances in one region.
+#[derive(Debug)]
+struct Fleet {
+    region: String,
+    instances: Vec<Instance>,
+}
+
+/// Every region enabled for the account, which is what `DescribeRegions` returns by default.
+async fn regions(ec2: &Client) -> Result<Vec<String>> {
+    let output = ec2
+        .describe_regions()
+        .send()
+        .await
+        .map_err(Error::aws("listing regions"))?;
+    Ok(output
+        .regions()
+        .iter()
+        .filter_map(|region| region.region_name())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Describes every region at once and keeps those with instances, sorted by region.
+///
+/// Also returns the regions that failed, so one blocked region (by an SCP, say) doesn't hide
+/// the rest. Only when every region fails is that an error, usually bad credentials.
+async fn scan(clients: Vec<(String, Client)>) -> Result<(Vec<Fleet>, Vec<String>)> {
+    let total = clients.len();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (region, client) in clients {
+        tasks.spawn(async move {
+            let found = describe(&client, None).await;
+            (region, found)
+        });
+    }
+    let mut results = tasks.join_all().await;
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut fleets = Vec::new();
+    let mut failed = Vec::new();
+    let mut first_error = None;
+    for (region, found) in results {
+        match found {
+            Ok(instances) if instances.is_empty() => {}
+            Ok(instances) => fleets.push(Fleet { region, instances }),
+            Err(err) => {
+                failed.push(region);
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    match first_error {
+        Some(err) if failed.len() == total => Err(err),
+        _ => Ok((fleets, failed)),
+    }
+}
+
+/// The fleet to start the region picker on: the region shown last time, else the configured
+/// region, else the first.
+fn preselect(fleets: &[Fleet], last: Option<&str>, configured: &str) -> usize {
+    [last, Some(configured)]
+        .into_iter()
+        .flatten()
+        .find_map(|region| fleets.iter().position(|fleet| fleet.region == region))
+        .unwrap_or_default()
+}
+
+/// `bracket list ec2`: finds the regions with instances, asks which to show (starting on the
+/// one shown last time), then lists it.
 pub async fn list() -> Result<()> {
     ui::intro("EC2 instances")?;
     let aws = Aws::load().await?;
-    let ec2 = Client::new(&aws.config);
-    let cloudwatch = aws_sdk_cloudwatch::Client::new(&aws.config);
+    let in_region = |region: &str| {
+        aws_sdk_ec2::config::Builder::from(&aws.config)
+            .region(Region::new(region.to_string()))
+            .build()
+    };
 
-    let (instances, cpu) = ui::step(
-        "Fetching instances",
+    let (mut fleets, failed, _) = ui::step(
+        "Scanning regions",
         async {
-            let instances = describe(&ec2, None).await?;
-            let running: Vec<String> = instances
-                .iter()
-                .filter(|instance| instance.state == State::Running)
-                .map(|instance| instance.id.clone())
+            let regions = regions(&Client::new(&aws.config)).await?;
+            let total = regions.len();
+            let clients = regions
+                .into_iter()
+                .map(|region| {
+                    let client = Client::from_conf(in_region(&region));
+                    (region, client)
+                })
                 .collect();
-            let cpu = metrics::latest_cpu(&cloudwatch, metrics::EC2, &running).await;
-            Ok((instances, cpu))
+            let (fleets, failed) = scan(clients).await?;
+            Ok((fleets, failed, total))
         },
-        |(instances, _)| format!("{} instances in {}", instances.len(), aws.region),
+        |(fleets, _, total)| format!("Found instances in {} of {total} regions", fleets.len()),
     )
     .await?;
 
-    if instances.is_empty() {
-        cliclack::outro("Nothing to show")?;
+    if !failed.is_empty() {
+        cliclack::log::warning(format!(
+            "Skipped regions that didn't answer: {}",
+            failed.join(", ")
+        ))?;
+    }
+    if fleets.is_empty() {
+        cliclack::outro("No instances in any region")?;
         return Ok(());
     }
+
+    let store = state::Store::from_config_dir();
+    let initial = preselect(
+        &fleets,
+        store
+            .as_ref()
+            .and_then(state::Store::last_region)
+            .as_deref(),
+        &aws.region,
+    );
+    // Only ask when there's a choice and someone to ask; otherwise take the preselection.
+    let index = match fleets.len() > 1 && console::Term::stderr().is_term() {
+        true => {
+            // Counts go in the label, since Clack only shows hints on the focused row.
+            let width = fleets
+                .iter()
+                .map(|fleet| fleet.region.len())
+                .max()
+                .unwrap_or_default();
+            fleets
+                .iter()
+                .enumerate()
+                .fold(
+                    cliclack::select("Which region?").initial_value(initial),
+                    |select, (index, fleet)| {
+                        let counts = console::style(state_counts(&fleet.instances))
+                            .dim()
+                            .for_stderr();
+                        select.item(index, format!("{:<width$}  {counts}", fleet.region), "")
+                    },
+                )
+                .interact()?
+        }
+        false => initial,
+    };
+    let Fleet { region, instances } = fleets.swap_remove(index);
+    store
+        .as_ref()
+        .map_or(Ok(()), |store| store.set_last_region(&region))
+        .or_else(|err| {
+            cliclack::log::warning(format!("Couldn't remember {region} for next time: {err}"))
+        })?;
+
+    let cloudwatch = aws_sdk_cloudwatch::Client::from_conf(
+        aws_sdk_cloudwatch::config::Builder::from(&aws.config)
+            .region(Region::new(region.clone()))
+            .build(),
+    );
+    let running: Vec<String> = instances
+        .iter()
+        .filter(|instance| instance.state == State::Running)
+        .map(|instance| instance.id.clone())
+        .collect();
+    let cpu = ui::step(
+        format!("Fetching CPU in {region}"),
+        async { Ok(metrics::latest_cpu(&cloudwatch, metrics::EC2, &running).await) },
+        |_| format!("{} instances in {region}", instances.len()),
+    )
+    .await?
     // CPU is a nice-to-have: without CloudWatch access the table still lists the fleet.
-    let cpu = cpu.unwrap_or_else(|err| {
+    .unwrap_or_else(|err| {
         let _ = cliclack::log::warning(format!("CPU unavailable: {err}"));
         HashMap::new()
     });
 
     let rows: Vec<[Cell; 6]> = instances
         .iter()
-        .map(|instance| row(instance, cpu.get(&instance.id).copied(), &aws.region))
+        .map(|instance| row(instance, cpu.get(&instance.id).copied(), &region))
         .collect();
     ui::print_table(["NAME", "STATE", "TYPE", "CPU", "INSTANCE ID", "IP"], &rows);
 
@@ -636,5 +776,109 @@ mod tests {
             .await
             .unwrap();
         assert!(!booted);
+    }
+
+    fn fleet(region: &str) -> Fleet {
+        Fleet {
+            region: region.into(),
+            instances: vec![instance("dev", State::Running)],
+        }
+    }
+
+    #[test]
+    fn the_last_region_is_preselected_then_the_configured_one() {
+        let fleets = [fleet("ap-south-1"), fleet("eu-west-2"), fleet("us-east-2")];
+        assert_eq!(preselect(&fleets, Some("us-east-2"), "eu-west-2"), 2);
+        assert_eq!(preselect(&fleets, None, "eu-west-2"), 1);
+        // A remembered region that has since emptied falls back to the configured one...
+        assert_eq!(preselect(&fleets, Some("sa-east-1"), "eu-west-2"), 1);
+        // ...and failing that, the first region.
+        assert_eq!(preselect(&fleets, Some("sa-east-1"), "us-west-1"), 0);
+    }
+
+    #[tokio::test]
+    async fn regions_come_from_describe_regions() {
+        use aws_sdk_ec2::{
+            operation::describe_regions::DescribeRegionsOutput, types::Region as SdkRegion,
+        };
+        let rule = mock!(Client::describe_regions).then_output(|| {
+            DescribeRegionsOutput::builder()
+                .regions(SdkRegion::builder().region_name("eu-west-2").build())
+                .regions(SdkRegion::builder().build())
+                .regions(SdkRegion::builder().region_name("us-east-2").build())
+                .build()
+        });
+        let client = mock_client!(aws_sdk_ec2, [&rule]);
+
+        assert_eq!(regions(&client).await.unwrap(), ["eu-west-2", "us-east-2"]);
+    }
+
+    fn region_client(instances: Vec<aws_sdk_ec2::types::Instance>) -> Client {
+        let rule = mock!(Client::describe_instances).then_output(move || {
+            DescribeInstancesOutput::builder()
+                .reservations(
+                    Reservation::builder()
+                        .set_instances(Some(instances.clone()))
+                        .build(),
+                )
+                .build()
+        });
+        mock_client!(aws_sdk_ec2, aws_smithy_mocks::RuleMode::MatchAny, [&rule])
+    }
+
+    fn failing_client() -> Client {
+        let rule = mock!(Client::describe_instances).then_error(|| {
+            aws_sdk_ec2::operation::describe_instances::DescribeInstancesError::generic(
+                aws_sdk_ec2::error::ErrorMetadata::builder()
+                    .code("UnauthorizedOperation")
+                    .message("denied by SCP")
+                    .build(),
+            )
+        });
+        mock_client!(aws_sdk_ec2, aws_smithy_mocks::RuleMode::MatchAny, [&rule])
+    }
+
+    #[tokio::test]
+    async fn scan_keeps_regions_with_instances_and_reports_failures() {
+        let clients = vec![
+            (
+                "us-east-2".to_string(),
+                region_client(vec![sdk_instance(
+                    "i-1",
+                    Some("a"),
+                    InstanceStateName::Running,
+                )]),
+            ),
+            ("ap-south-1".to_string(), failing_client()),
+            ("eu-west-1".to_string(), region_client(vec![])),
+            (
+                "eu-west-2".to_string(),
+                region_client(vec![sdk_instance(
+                    "i-2",
+                    Some("b"),
+                    InstanceStateName::Stopped,
+                )]),
+            ),
+        ];
+
+        let (fleets, failed) = scan(clients).await.unwrap();
+
+        let regions: Vec<_> = fleets.iter().map(|fleet| fleet.region.as_str()).collect();
+        assert_eq!(regions, ["eu-west-2", "us-east-2"]);
+        assert_eq!(fleets[1].instances[0].id, "i-1");
+        assert_eq!(failed, ["ap-south-1"]);
+    }
+
+    #[tokio::test]
+    async fn scan_fails_only_when_every_region_fails() {
+        let clients = vec![
+            ("eu-west-2".to_string(), failing_client()),
+            ("us-east-2".to_string(), failing_client()),
+        ];
+        let err = scan(clients).await.unwrap_err();
+        assert!(err.to_string().contains("UnauthorizedOperation"), "{err}");
+
+        let (fleets, failed) = scan(vec![]).await.unwrap();
+        assert!(fleets.is_empty() && failed.is_empty());
     }
 }

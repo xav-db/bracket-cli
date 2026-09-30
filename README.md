@@ -32,7 +32,7 @@ bracket uses your normal AWS credentials and region, so whatever works for the A
 | Command | What it does |
 | --- | --- |
 | `bracket connect ec2 [name]` | Starts the instance if needed, waits for SSH, and opens it in Cursor. |
-| `bracket list ec2` | Lists instances with state, type, CPU, and IP. `bracket ls ec2` does the same. |
+| `bracket list ec2` | Asks which region to show (only regions with instances, starting on the one you picked last), then lists instances with state, type, CPU, and IP. `bracket ls ec2` does the same. |
 | `bracket list neptune` | Lists Neptune clusters with status, size, and CPU. |
 | `bracket stop ec2 [name]` | Stops an instance. |
 | `bracket stop neptune [name]` | Stops a Neptune cluster. |
