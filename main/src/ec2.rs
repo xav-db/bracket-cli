@@ -489,8 +489,12 @@ fn state_counts(instances: &[Instance]) -> String {
 pub async fn stop(name: Option<String>) -> Result<()> {
     ui::intro("stop EC2 instance")?;
     let aws = Aws::load().await?;
-    let ec2 = Client::new(&aws.config);
-    let instance = pick(&ec2, name, "Which instance should be stopped?").await?;
+    stop_with(&Client::new(&aws.config), name).await
+}
+
+/// `bracket stop ec2` after setup, taking the client so tests can mock it.
+async fn stop_with(ec2: &Client, name: Option<String>) -> Result<()> {
+    let instance = pick(ec2, name, "Which instance should be stopped?").await?;
     let name = instance.display_name();
 
     match instance.state {
@@ -880,5 +884,74 @@ mod tests {
 
         let (fleets, failed) = scan(vec![]).await.unwrap();
         assert!(fleets.is_empty() && failed.is_empty());
+    }
+
+    fn stop_rule() -> aws_smithy_mocks::Rule {
+        mock!(Client::stop_instances)
+            .match_requests(|req| req.instance_ids() == ["i-1"])
+            .then_output(|| {
+                aws_sdk_ec2::operation::stop_instances::StopInstancesOutput::builder().build()
+            })
+    }
+
+    fn describe_rule(state: InstanceStateName) -> aws_smithy_mocks::Rule {
+        mock!(Client::describe_instances).then_output(move || {
+            DescribeInstancesOutput::builder()
+                .reservations(
+                    Reservation::builder()
+                        .instances(sdk_instance("i-1", Some("dev"), state.clone()))
+                        .build(),
+                )
+                .build()
+        })
+    }
+
+    #[tokio::test]
+    async fn stopping_a_running_instance_sends_one_stop() {
+        let (describe, stop) = (describe_rule(InstanceStateName::Running), stop_rule());
+        let client = mock_client!(
+            aws_sdk_ec2,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            [&describe, &stop]
+        );
+
+        stop_with(&client, Some("dev".into())).await.unwrap();
+
+        assert_eq!(stop.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_stopped_instance_does_nothing() {
+        let (describe, stop) = (describe_rule(InstanceStateName::Stopped), stop_rule());
+        let client = mock_client!(
+            aws_sdk_ec2,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            [&describe, &stop]
+        );
+
+        stop_with(&client, Some("dev".into())).await.unwrap();
+
+        assert_eq!(stop.num_calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_instances_are_waited_for_not_started() {
+        let describe = describe_rule(InstanceStateName::Running);
+        let start = mock!(Client::start_instances).then_output(|| {
+            aws_sdk_ec2::operation::start_instances::StartInstancesOutput::builder().build()
+        });
+        let client = mock_client!(
+            aws_sdk_ec2,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            [&describe, &start]
+        );
+
+        let booted = ensure_running(&client, &instance("dev", State::Pending))
+            .await
+            .unwrap();
+
+        assert!(booted);
+        assert_eq!(start.num_calls(), 0);
+        assert!(describe.num_calls() >= 1);
     }
 }

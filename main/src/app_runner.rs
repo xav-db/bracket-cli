@@ -54,9 +54,12 @@ async fn describe(client: &Client) -> Result<Vec<Service>> {
 pub async fn redeploy(name: Option<String>) -> Result<()> {
     ui::intro("redeploy App Runner service")?;
     let aws = Aws::load().await?;
-    let client = Client::new(&aws.config);
+    redeploy_with(&Client::new(&aws.config), name).await
+}
 
-    let services = ui::step("Fetching services", describe(&client), |services| {
+/// `bracket app-runner redeploy` after setup, taking the client so tests can mock it.
+async fn redeploy_with(client: &Client, name: Option<String>) -> Result<()> {
+    let services = ui::step("Fetching services", describe(client), |services| {
         format!("Found {} services", services.len())
     })
     .await?;
@@ -90,7 +93,7 @@ pub async fn redeploy(name: Option<String>) -> Result<()> {
             "Deploying {} (Ctrl-C stops watching; the deployment carries on)",
             service.name
         ),
-        follow(&client, &service.arn, &operation),
+        follow(client, &service.arn, &operation),
         |_| {
             format!(
                 "Deployed {} in {}",
@@ -286,5 +289,50 @@ mod tests {
                 url: Some("api.awsapprunner.com".into()),
             }
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redeploy_deploys_the_named_service_and_follows_it() {
+        let services = mock!(Client::list_services).then_output(|| {
+            ListServicesOutput::builder()
+                .service_summary_list(
+                    ServiceSummary::builder()
+                        .service_name("api")
+                        .service_arn("arn:api")
+                        .status(ServiceStatus::Running)
+                        .build(),
+                )
+                .build()
+                .unwrap()
+        });
+        let deploy = mock!(Client::start_deployment)
+            .match_requests(|req| req.service_arn() == Some("arn:api"))
+            .then_output(|| {
+                aws_sdk_apprunner::operation::start_deployment::StartDeploymentOutput::builder()
+                    .operation_id("op-1")
+                    .build()
+                    .unwrap()
+            });
+        let operations = mock!(Client::list_operations)
+            .then_output(|| operations("op-1", OperationStatus::Succeeded));
+        let client = mock_client!(
+            aws_sdk_apprunner,
+            RuleMode::MatchAny,
+            [&services, &deploy, &operations]
+        );
+
+        redeploy_with(&client, Some("api".into())).await.unwrap();
+        let err = redeploy_with(&client, Some("web".into()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(deploy.num_calls(), 1);
+        assert!(matches!(
+            err,
+            Error::NotFound {
+                kind: Resource::AppRunnerService,
+                ..
+            }
+        ));
     }
 }

@@ -136,9 +136,12 @@ fn row(cluster: &Cluster, cpu: Option<f64>, region: &str) -> [Cell; 5] {
 pub async fn stop(name: Option<String>) -> Result<()> {
     ui::intro("stop Neptune cluster")?;
     let aws = Aws::load().await?;
-    let neptune = Client::new(&aws.config);
+    stop_with(&Client::new(&aws.config), name).await
+}
 
-    let clusters = ui::step("Fetching clusters", describe(&neptune), |clusters| {
+/// `bracket stop neptune` after setup, taking the client so tests can mock it.
+async fn stop_with(neptune: &Client, name: Option<String>) -> Result<()> {
+    let clusters = ui::step("Fetching clusters", describe(neptune), |clusters| {
         format!("Found {} clusters", clusters.len())
     })
     .await?;
@@ -253,5 +256,58 @@ mod tests {
             clusters.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             ["alpha", "zeta"]
         );
+    }
+
+    fn clusters_rule() -> aws_smithy_mocks::Rule {
+        mock!(Client::describe_db_clusters).then_output(|| {
+            DescribeDbClustersOutput::builder()
+                .db_clusters(sdk_cluster("graph", "neptune", "available"))
+                .db_clusters(sdk_cluster("idle", "neptune", "stopped"))
+                .build()
+        })
+    }
+
+    fn stop_rule() -> aws_smithy_mocks::Rule {
+        mock!(Client::stop_db_cluster)
+            .match_requests(|req| req.db_cluster_identifier() == Some("graph"))
+            .then_output(|| {
+                aws_sdk_neptune::operation::stop_db_cluster::StopDbClusterOutput::builder().build()
+            })
+    }
+
+    #[tokio::test]
+    async fn stopping_an_available_cluster_sends_one_stop() {
+        let (clusters, stop) = (clusters_rule(), stop_rule());
+        let client = mock_client!(
+            aws_sdk_neptune,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            [&clusters, &stop]
+        );
+
+        stop_with(&client, Some("graph".into())).await.unwrap();
+
+        assert_eq!(stop.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn stopped_and_unknown_clusters_are_not_stopped() {
+        let (clusters, stop) = (clusters_rule(), stop_rule());
+        let client = mock_client!(
+            aws_sdk_neptune,
+            aws_smithy_mocks::RuleMode::MatchAny,
+            [&clusters, &stop]
+        );
+
+        stop_with(&client, Some("idle".into())).await.unwrap();
+        let err = stop_with(&client, Some("ghost".into())).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::NotFound {
+                kind: Resource::NeptuneCluster,
+                ..
+            }
+        ));
+        assert_eq!(stop.num_calls(), 0);
     }
 }
