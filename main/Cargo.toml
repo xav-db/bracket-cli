@@ -1,29 +1,43 @@
 [package]
 name = "bracket"
-version = "1.1.4"
-edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+version = "1.2.0"
+edition = "2024"
+description = "Connect to, list, and manage Bracket's AWS dev infrastructure."
+license-file = "../LICENSE.txt"
+repository = "https://github.com/xav-db/bracket-cli"
+publish = false
 
 [dependencies]
-aws-config = "1.5.14"
-aws-sdk-ec2 = "1.103.0"
-aws-sdk-ec2instanceconnect = "1.54.0"
-aws-sdk-neptune = "1.56.0"
-aws-sdk-cloudwatch = "1.60.0"
-aws-smithy-types = "1.2.12"
-aws-sdk-apprunner = "1.55.0"
-clap = { version = "4.4.12", features = ["derive"] }
-tokio = { version = "1.35.1", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-dirs = "5.0.1"
-duct = "0.13"
-chrono = "0.4.31"
-regex = "1"
-dialoguer = "0.11.0"
-rpassword = "7.3.1"
-toml = "0.8.19"
-reqwest = "0.12.7"
-semver = "1.0.23"
-colored = "2.1.0"
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-sdk-apprunner = "1.114.0"
+aws-sdk-cloudwatch = "1.133.0"
+aws-sdk-ec2 = "1.266.0"
+aws-sdk-ec2instanceconnect = "1.114.0"
+aws-sdk-neptune = "1.118.0"
+aws-sdk-pricing = "1.117.0"
+aws-sdk-sts = "1.118.0"
+clap = { version = "4.6.7", features = ["derive"] }
+cliclack = "0.5.6"
+console = "0.16.6"
+dirs = "7.0.0"
+ratatui = "0.30.2"
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "time", "process", "net", "io-std", "io-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+aws-sdk-apprunner = { version = "1.114.0", features = ["test-util"] }
+aws-sdk-cloudwatch = { version = "1.133.0", features = ["test-util"] }
+aws-sdk-ec2 = { version = "1.266.0", features = ["test-util"] }
+aws-sdk-neptune = { version = "1.118.0", features = ["test-util"] }
+aws-sdk-pricing = { version = "1.117.0", features = ["test-util"] }
+aws-smithy-mocks = "0.3.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["rt", "macros", "io-util", "net", "test-util"] }

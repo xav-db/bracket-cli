@@ -1,0 +1,83 @@
+# Publishes v<version> from main/Cargo.toml whenever main has a version without a release.
+# To release, bump the version in main/Cargo.toml and merge.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      released: ${{ steps.version.outputs.released }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(grep -m1 '^version' main/Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.released == 'false'
+    strategy:
+      matrix:
+        include:
+          # The oldest supported Ubuntu, so the binaries need the oldest glibc (2.35).
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, asset: bracket-cli-linux-amd64 }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, asset: bracket-cli-linux-arm64 }
+          - { runner: macos-latest, target: aarch64-apple-darwin, asset: bracket-cli-macos-arm64 }
+          - { runner: macos-latest, target: x86_64-apple-darwin, asset: bracket-cli-macos-amd64 }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, asset: bracket-cli-windows-amd64.exe }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        working-directory: main
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Stage asset
+        shell: bash
+        run: |
+          binary="main/target/${{ matrix.target }}/release/bracket"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then binary="$binary.exe"; fi
+          cp "$binary" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ needs.version.outputs.tag }}" dist/*
+          --repo "${{ github.repository }}"
+          --target "${{ github.sha }}"
+          --title "${{ needs.version.outputs.tag }}"
+          --generate-notes

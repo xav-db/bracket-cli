@@ -1,89 +1,54 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Installs the latest bracket release for this machine:
+#
+#   curl -fsSL https://raw.githubusercontent.com/xav-db/bracket-cli/main/install/install.sh | bash
+#
+# Set BRACKET_INSTALL_DIR to install somewhere other than ~/.local/bin.
+set -euo pipefail
 
-# Set your repository
-REPO="xavcochran/bracket-cli"
+REPO="xav-db/bracket-cli"
+INSTALL_DIR="${BRACKET_INSTALL_DIR:-$HOME/.local/bin}"
 
-# Fetch the latest release version from GitHub API
-VERSION=$(curl --silent "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
+case "$(uname -s)" in
+  Linux) os=linux ;;
+  Darwin) os=macos ;;
+  *) echo "bracket: unsupported OS: $(uname -s)" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64 | amd64) arch=amd64 ;;
+  arm64 | aarch64) arch=arm64 ;;
+  *) echo "bracket: unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
 
-if [[ -z "$VERSION" ]]; then
-    echo "Failed to fetch the latest version. Please check your internet connection or the repository."
-    exit 1
-fi
-
-echo "Latest version is $VERSION"
-
-# Detect the operating system
-OS=$(uname -s)
-ARCH=$(uname -m)
-
-INSTALL_DIR="$HOME/.local/bin"
+url="https://github.com/$REPO/releases/latest/download/bracket-cli-$os-$arch"
 mkdir -p "$INSTALL_DIR"
+tmp="$(mktemp "$INSTALL_DIR/.bracket.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
 
-# Ensure that $HOME/.local/bin is in the PATH
-if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    echo "Adding $HOME/.local/bin to PATH"
-    export PATH="$HOME/.local/bin:$PATH"
-    # Add it to .bashrc or .zshrc for persistence
-    if [[ "$SHELL" == *"bash"* ]]; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-    elif [[ "$SHELL" == *"zsh"* ]]; then
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
-    fi
-fi
+echo "Downloading $url"
+curl -fsSL "$url" -o "$tmp"
+chmod 755 "$tmp"
+# Rename rather than write in place: overwriting a running binary fails on Linux
+# ("text file busy") and can get it killed on macOS. This is what `bracket update` relies on.
+mv -f "$tmp" "$INSTALL_DIR/bracket"
+trap - EXIT
 
-# Determine the appropriate binary to download
-if [[ "$OS" == "Linux" ]]; then
-    if [[ "$ARCH" == "x86_64" ]]; then
-        FILE="bracket-cli-linux-amd64"
-    elif [[ "$ARCH" == "arm64" ]]; then
-        FILE="bracket-cli-linux-arm64"
+echo "Installed $("$INSTALL_DIR/bracket" --version) to $INSTALL_DIR"
+
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *)
+    case "${SHELL:-}" in
+      *zsh) rc="$HOME/.zshrc" ;;
+      *bash) rc="$HOME/.bashrc" ;;
+      *) rc="" ;;
+    esac
+    line="export PATH=\"$INSTALL_DIR:\$PATH\""
+    if [[ -n "$rc" ]]; then
+      grep -qxF "$line" "$rc" 2>/dev/null || printf '\n%s\n' "$line" >> "$rc"
+      echo "Added $INSTALL_DIR to your PATH in $rc. Open a new terminal to use bracket."
     else
-        echo "Unsupported architecture: $ARCH"
-        exit 1
+      echo "Add $INSTALL_DIR to your PATH to use bracket."
     fi
-elif [[ "$OS" == "Darwin" ]]; then
-    if [[ "$ARCH" == "x86_64" ]]; then
-        FILE="bracket-cli-macos-amd64"
-    elif [[ "$ARCH" == "arm64" ]]; then
-        FILE="bracket-cli-macos-arm64"
-    else
-        echo "Unsupported architecture: $ARCH"
-        exit 1
-    fi
-else
-    echo "Unsupported OS: $OS"
-    exit 1
-fi
-
-# Download the binary
-URL="https://github.com/$REPO/releases/download/$VERSION/$FILE"
-echo "Downloading from $URL"
-curl -L $URL -o "$INSTALL_DIR/bracket"
-
-# Make the binary executable
-chmod +x "$INSTALL_DIR/bracket"
-
-# Verify installation
-if command -v bracket >/dev/null 2>&1; then
-    echo "Installation successful!"
-else
-    echo "Installation failed."
-    exit 1
-fi
-
-echo "Installing dependencies..."
-if ! command -v git &> /dev/null
-then
-    echo "Git is not installed. Installing Git..."
-    if [[ "$OS" == "Linux" ]]
-    then
-        sudo apt update
-        sudo apt install git
-    elif [[ "$OS" == "Darwin" ]]
-    then
-        brew install git
-    fi
-else
-    echo "Git is already installed. Skipping installation."
-fi
+    ;;
+esac
